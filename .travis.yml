@@ -8,15 +8,14 @@ notifications:
   email: false
 
 install:
+  - export VERSION=4.0.0
   - pip install cython networkx
-  - wget http://scip.zib.de/download/release/scipoptsuite-3.2.1.tgz
-  - tar xzf scipoptsuite-3.2.1.tgz
-  - cd scipoptsuite-3.2.1/
-  - rm Makefile.doit
-  - wget http://scip.zib.de/download/bugfixes/scip-3.2.1/Makefile.doit
-  - make COMP=clang SHARED=true GMP=false READLINE=false ZIMPL=false scipoptlib
-  - export SCIPOPTDIR=`pwd`
+  - wget http://scip.zib.de/download/release/scipoptsuite-$VERSION.tgz
+  - tar xzf scipoptsuite-$VERSION.tgz
+  - cd scipoptsuite-$VERSION
+  - make COMP=clang SHARED=true GMP=false READLINE=false ZIMPL=false
+  - make install INSTALLDIR=~/scipdir COMP=clang SHARED=true GMP=false READLINE=false ZIMPL=false
   - cd ..
-  - python setup.py install
+  - env SCIPOPTDIR=~/scipdir python setup.py install
 
 script: py.test tests
