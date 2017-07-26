@@ -268,6 +268,10 @@ cdef class Variable(Expr):
         """Returns current objective value of variable"""
         return SCIPvarGetObj(self.var)
 
+    def getLPSol(self):
+        """Returns the current LP solution value of variable"""
+        return SCIPvarGetLPSol(self.var)
+
 
 cdef class Constraint:
     cdef SCIP_CONS* cons
@@ -275,6 +279,8 @@ cdef class Constraint:
 
     @staticmethod
     cdef create(SCIP_CONS* scipcons):
+        if scipcons == NULL:
+            raise Warning("cannot create Constraint with SCIP_CONS* == NULL")
         cons = Constraint()
         cons.cons = scipcons
         return cons
@@ -441,18 +447,30 @@ cdef class Model:
         """
         PY_SCIP_CALL(SCIPsetObjlimit(self._scip, objlimit))
 
-    def setObjective(self, coeffs, sense = 'minimize'):
-        """Establish the objective function, either as a variable dictionary or as a linear expression.
+    def setObjective(self, coeffs, sense = 'minimize', clear = 'true'):
+        """Establish the objective function as a linear expression.
 
         Keyword arguments:
         coeffs -- the coefficients
         sense -- the objective sense (default 'minimize')
+        clear -- set all other variables objective coefficient to zero (default 'true')
         """
+        cdef SCIP_VAR** _vars
+        cdef int _nvars
         assert isinstance(coeffs, Expr)
+
         if coeffs.degree() > 1:
             raise ValueError("Nonlinear objective functions are not supported!")
         if coeffs[CONST] != 0.0:
             raise ValueError("Constant offsets in objective are not supported!")
+
+        if clear:
+            # clear existing objective function
+            _vars = SCIPgetOrigVars(self._scip)
+            _nvars = SCIPgetNOrigVars(self._scip)
+            for i in range(_nvars):
+                PY_SCIP_CALL(SCIPchgVarObj(self._scip, _vars[i], 0.0))
+
         for term, coef in coeffs.terms.items():
             # avoid CONST term of Expr
             if term != CONST:
@@ -503,6 +521,16 @@ cdef class Model:
         """
         PY_SCIP_CALL(SCIPsetHeuristics(self._scip, setting, True))
 
+    def disablePropagation(self, onlyroot=False):
+        """Disables propagation in SCIP to avoid modifying the original problem during transformation.
+
+        Keyword arguments:
+        onlyroot -- use propagation when root processing is finished
+        """
+        self.setIntParam("propagating/maxroundsroot", 0)
+        if not onlyroot:
+            self.setIntParam("propagating/maxrounds", 0)
+
     # Write original problem to file
     def writeProblem(self, filename='origprob.cip'):
         """Write original problem to a file.
@@ -525,13 +553,18 @@ cdef class Model:
         """Create a new variable.
 
         Keyword arguments:
-        name -- the name of the variable (default '')
+        name -- the name of the variable (use generic name if empty)
         vtype -- the typ of the variable (default 'C')
         lb -- the lower bound of the variable (default 0.0)
         ub -- the upper bound of the variable (default None)
         obj -- the objective value of the variable (default 0.0)
         pricedVar -- is the variable a pricing candidate? (default False)
         """
+
+        # replace empty name with generic one
+        if name == '':
+            name = 'x'+str(SCIPgetNVars(self._scip)+1)
+
         cname = str_conversion(name)
         if ub is None:
             ub = SCIPinfinity(self._scip)
@@ -584,23 +617,23 @@ cdef class Model:
         """
         PY_SCIP_CALL(SCIPaddVarLocks(self._scip, var.var, nlocksdown, nlocksup))
 
-    def chgVarLb(self, Variable var, lb=None):
+    def chgVarLb(self, Variable var, lb):
         """Changes the lower bound of the specified variable.
 
         Keyword arguments:
         var -- the variable
-        lb -- the lower bound (default None)
+        lb -- the lower bound (set to None for -infinity)
         """
         if lb is None:
            lb = -SCIPinfinity(self._scip)
         PY_SCIP_CALL(SCIPchgVarLb(self._scip, var.var, lb))
 
-    def chgVarUb(self, Variable var, ub=None):
+    def chgVarUb(self, Variable var, ub):
         """Changes the upper bound of the specified variable.
 
         Keyword arguments:
         var -- the variable
-        ub -- the upper bound (default None)
+        ub -- the upper bound (set to None for +infinity)
         """
         if ub is None:
            ub = SCIPinfinity(self._scip)
@@ -640,7 +673,7 @@ cdef class Model:
         return [Variable.create(_vars[i]) for i in range(_nvars)]
 
     # Constraint functions
-    def addCons(self, cons, name="cons", initial=True, separate=True,
+    def addCons(self, cons, name='', initial=True, separate=True,
                 enforce=True, check=True, propagate=True, local=False,
                 modifiable=False, dynamic=False, removable=False,
                 stickingatnode=False):
@@ -648,7 +681,7 @@ cdef class Model:
 
         Keyword arguments:
         cons -- list of coefficients
-        name -- the name of the constraint (default 'cons')
+        name -- the name of the constraint (use generic name if empty)
         initial -- should the LP relaxation of constraint be in the initial LP? (default True)
         separate -- should the constraint be separated during LP processing? (default True)
         enforce -- should the constraint be enforced during node processing? (default True)
@@ -661,6 +694,11 @@ cdef class Model:
         stickingatnode -- should the constraint always be kept at the node where it was added, even if it may be moved to a more global node? (default False)
         """
         assert isinstance(cons, ExprCons)
+
+        # replace empty name with generic one
+        if name == '':
+            name = 'c'+str(SCIPgetNConss(self._scip)+1)
+
         kwargs = dict(name=name, initial=initial, separate=separate,
                       enforce=enforce, check=check,
                       propagate=propagate, local=local,
@@ -909,7 +947,7 @@ cdef class Model:
 
         PY_SCIP_CALL(SCIPcreateConsCardinality(self._scip, &scip_cons, str_conversion(name), 0, NULL, cardval, NULL, NULL,
             initial, separate, enforce, check, propagate, local, dynamic, removable, stickingatnode))
-        
+
         # circumvent an annoying bug in SCIP 4.0.0 that does not allow uninitialized weights
         if weights is None:
             weights = list(range(1, len(consvars) + 1))
@@ -1040,6 +1078,137 @@ cdef class Model:
         """
         PY_SCIP_CALL(SCIPappendVarSOS2(self._scip, cons.cons, var.var))
 
+    def chgRhs(self, Constraint cons, rhs):
+        """Change right hand side value of a constraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint
+        rhs -- new right hand side (set to None for +infinity)
+        """
+
+        if rhs is None:
+           rhs = SCIPinfinity(self._scip)
+
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            PY_SCIP_CALL(SCIPchgRhsLinear(self._scip, cons.cons, rhs))
+        elif constype == 'quadratic':
+            PY_SCIP_CALL(SCIPchgRhsQuadratic(self._scip, cons.cons, rhs))
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+    def chgLhs(self, Constraint cons, lhs):
+        """Change left hand side value of a constraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint
+        lhs -- new left hand side (set to None for -infinity)
+        """
+
+        if lhs is None:
+           lhs = -SCIPinfinity(self._scip)
+
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            PY_SCIP_CALL(SCIPchgLhsLinear(self._scip, cons.cons, lhs))
+        elif constype == 'quadratic':
+            PY_SCIP_CALL(SCIPchgLhsQuadratic(self._scip, cons.cons, lhs))
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+    def getRhs(self, Constraint cons):
+        """Retrieve right hand side value of a constraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint
+        """
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            return SCIPgetRhsLinear(self._scip, cons.cons)
+        elif constype == 'quadratic':
+            return SCIPgetRhsQuadratic(self._scip, cons.cons)
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+    def getLhs(self, Constraint cons):
+        """Retrieve left hand side value of a constraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint
+        """
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            return SCIPgetLhsLinear(self._scip, cons.cons)
+        elif constype == 'quadratic':
+            return SCIPgetLhsQuadratic(self._scip, cons.cons)
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+    def getActivity(self, Constraint cons, Solution sol = None):
+        """Retrieve slack of given contraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint to compute slack of
+        sol -- solution to compute slack of (default None to use current node's solution)
+        """
+        cdef SCIP_Real activity
+        cdef SCIP_SOL* scip_sol
+
+        if isinstance(sol, Solution):
+            scip_sol = sol.sol
+        else:
+            scip_sol = NULL
+
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            activity = SCIPgetActivityLinear(self._scip, cons.cons, scip_sol)
+        elif constype == 'quadratic':
+            PY_SCIP_CALL(SCIPgetActivityQuadratic(self._scip, cons.cons, scip_sol, &activity))
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+        return activity
+
+
+    def getSlack(self, Constraint cons, Solution sol = None, side = None):
+        """Retrieve slack of given contraint.
+
+        Keyword arguments:
+        cons -- linear or quadratic constraint to compute slack of
+        sol -- solution to compute slack of (default None to use current node's solution)
+        side -- whether to use lhs or rhs for ranged constraints ('lhs' or 'rhs'),
+                return minimum of left and right slack if not specified
+        """
+        cdef SCIP_Real activity
+        cdef SCIP_SOL* scip_sol
+
+        if isinstance(sol, Solution):
+            scip_sol = sol.sol
+        else:
+            scip_sol = NULL
+
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if constype == 'linear':
+            lhs = SCIPgetLhsLinear(self._scip, cons.cons)
+            rhs = SCIPgetRhsLinear(self._scip, cons.cons)
+            activity = SCIPgetActivityLinear(self._scip, cons.cons, scip_sol)
+        elif constype == 'quadratic':
+            lhs = SCIPgetLhsQuadratic(self._scip, cons.cons)
+            rhs = SCIPgetRhsQuadratic(self._scip, cons.cons)
+            PY_SCIP_CALL(SCIPgetActivityQuadratic(self._scip, cons.cons, scip_sol, &activity))
+        else:
+            raise Warning("method cannot be called for constraints of type " + constype)
+
+        lhsslack = activity - lhs
+        rhsslack = rhs - activity
+
+        if side == 'lhs':
+            return lhsslack
+        elif side == 'rhs':
+            return rhsslack
+        else:
+            return min(lhsslack, rhsslack)
+
     def getTransformedCons(self, Constraint cons):
         """Retrieve transformed constraint.
 
@@ -1061,6 +1230,22 @@ cdef class Model:
         _nconss = SCIPgetNConss(self._scip)
         return [Constraint.create(_conss[i]) for i in range(_nconss)]
 
+    def delCons(self, Constraint cons):
+        """Delete constraint from the model
+
+        Keyword arguments:
+        cons -- constraint to be deleted
+        """
+        PY_SCIP_CALL(SCIPdelCons(self._scip, cons.cons))
+
+    def delConsLocal(self, Constraint cons):
+        """Delete constraint from the current node and it's children
+
+        Keyword arguments:
+        cons -- constraint to be deleted
+        """
+        PY_SCIP_CALL(SCIPdelConsLocal(self._scip, cons.cons))
+
     def getDualsolLinear(self, Constraint cons):
         """Retrieve the dual solution to a linear constraint.
 
@@ -1068,11 +1253,36 @@ cdef class Model:
         cons -- the linear constraint
         """
         # TODO this should ideally be handled on the SCIP side
-        if cons.isOriginal():
-            transcons = <Constraint>self.getTransformedCons(cons)
-            return SCIPgetDualsolLinear(self._scip, transcons.cons)
-        else:
-            return SCIPgetDualsolLinear(self._scip, cons.cons)
+        cdef int _nvars
+        cdef SCIP_VAR** _vars
+        cdef SCIP_Bool _success
+        dual = 0.0
+
+        constype = bytes(SCIPconshdlrGetName(SCIPconsGetHdlr(cons.cons))).decode('UTF-8')
+        if not constype == 'linear':
+            raise Warning("dual solution values not available for constraints of type ", constype)
+
+        try:
+            _nvars = SCIPgetNVarsLinear(self._scip, cons.cons)
+            if cons.isOriginal():
+                transcons = <Constraint>self.getTransformedCons(cons)
+            else:
+                transcons = cons
+            if _nvars > 1:
+                dual = SCIPgetDualsolLinear(self._scip, transcons.cons)
+            else:
+                _vars = SCIPgetVarsLinear(self._scip, transcons.cons)
+                LPsol = SCIPvarGetLPSol(_vars[0])
+                rhs = SCIPgetRhsLinear(self._scip, transcons.cons)
+                lhs = SCIPgetLhsLinear(self._scip, transcons.cons)
+                if (LPsol == rhs) or (LPsol == lhs):
+                    dual = SCIPgetVarRedcost(self._scip, _vars[0])
+
+            if self.getObjectiveSense() == "maximize":
+                dual = -dual
+        except:
+            raise Warning("no dual solution available for constraint " + cons.name)
+        return dual
 
     def getDualfarkasLinear(self, Constraint cons):
         """Retrieve the dual farkas value to a linear constraint.
@@ -1086,6 +1296,21 @@ cdef class Model:
             return SCIPgetDualfarkasLinear(self._scip, transcons.cons)
         else:
             return SCIPgetDualfarkasLinear(self._scip, cons.cons)
+
+    def getVarRedcost(self, Variable var):
+        """Retrieve the reduced cost of a variable.
+
+        Keyword arguments:
+        var -- variable to get the reduced cost of
+        """
+        redcost = None
+        try:
+            redcost = SCIPgetVarRedcost(self._scip, var.var)
+            if self.getObjectiveSense() == "maximize":
+                redcost = -redcost
+        except:
+            raise Warning("no reduced cost available for variable " + var.name)
+        return redcost
 
     def optimize(self):
         """Optimize the problem."""
@@ -1259,47 +1484,6 @@ cdef class Model:
         heur.name = name
         Py_INCREF(heur)
 
-    def createSol(self, Heur heur):
-        """Create a new primal solution.
-
-        Keyword arguments:
-        solution -- the new solution
-        heur -- the heuristic that found the solution
-        """
-        n = str_conversion(heur.name)
-        cdef SCIP_HEUR* _heur
-        _heur = SCIPfindHeur(self._scip, n)
-        solution = Solution()
-        PY_SCIP_CALL(SCIPcreateSol(self._scip, &solution.sol, _heur))
-        return solution
-
-    def setSolVal(self, Solution solution, Variable var, val):
-        """Set a variable in a solution.
-
-        Keyword arguments:
-        solution -- the solution to be modified
-        var -- the variable in the solution
-        val -- the value of the variable in the solution
-        """
-        cdef SCIP_SOL* _sol
-        _sol = <SCIP_SOL*>solution.sol
-        PY_SCIP_CALL(SCIPsetSolVal(self._scip, _sol, var.var, val))
-
-    def trySol(self, Solution solution, printreason=True, completely=False, checkbounds=True, checkintegrality=True, checklprows=True):
-        """Try to add a solution to the storage.
-
-        Keyword arguments:
-        solution -- the solution to store
-        printreason -- should all reasons of violations be printed?
-        completely -- should all violation be checked?
-        checkbounds -- should the bounds of the variables be checked?
-        checkintegrality -- has integrality to be checked?
-        checklprows -- have current LP rows (both local and global) to be checked?
-        """
-        cdef SCIP_Bool stored
-        PY_SCIP_CALL(SCIPtrySolFree(self._scip, &solution.sol, printreason, completely, checkbounds, checkintegrality, checklprows, &stored))
-        return stored
-
     def includeBranchrule(self, Branchrule branchrule, name, desc, priority, maxdepth, maxbounddist):
         """Include a branching rule.
 
@@ -1322,6 +1506,77 @@ cdef class Model:
         Py_INCREF(branchrule)
 
     # Solution functions
+
+    def createSol(self, Heur heur = None):
+        """Create a new primal solution.
+
+        Keyword arguments:
+        solution -- the new solution
+        heur -- the heuristic that found the solution
+        """
+        cdef SCIP_HEUR* _heur
+
+        if isinstance(heur, Heur):
+            n = str_conversion(heur.name)
+            _heur = SCIPfindHeur(self._scip, n)
+        else:
+            _heur = NULL
+        solution = Solution()
+        PY_SCIP_CALL(SCIPcreateSol(self._scip, &solution.sol, _heur))
+        return solution
+
+    def setSolVal(self, Solution solution, Variable var, val):
+        """Set a variable in a solution.
+
+        Keyword arguments:
+        solution -- the solution to be modified
+        var -- the variable in the solution
+        val -- the value of the variable in the solution
+        """
+        cdef SCIP_SOL* _sol
+        _sol = <SCIP_SOL*>solution.sol
+        PY_SCIP_CALL(SCIPsetSolVal(self._scip, _sol, var.var, val))
+
+    def trySol(self, Solution solution, printreason=True, completely=False, checkbounds=True, checkintegrality=True, checklprows=True, free=True):
+        """Check given primal solution for feasibility and try to add it to the storage.
+
+        Keyword arguments:
+        solution -- the solution to store
+        printreason -- should all reasons of violations be printed?
+        completely -- should all violation be checked?
+        checkbounds -- should the bounds of the variables be checked?
+        checkintegrality -- has integrality to be checked?
+        checklprows -- have current LP rows (both local and global) to be checked?
+        free -- should solution be freed (default True)
+        """
+        cdef SCIP_Bool stored
+        if free:
+            PY_SCIP_CALL(SCIPtrySolFree(self._scip, &solution.sol, printreason, completely, checkbounds, checkintegrality, checklprows, &stored))
+        else:
+            PY_SCIP_CALL(SCIPtrySol(self._scip, solution.sol, printreason, completely, checkbounds, checkintegrality, checklprows, &stored))
+        return stored
+
+    def addSol(self, Solution solution, free=True):
+        """Try to add a solution to the storage.
+
+        Keyword arguments:
+        solution -- the solution to store
+        free -- should solution be free afterwards (default True)
+        """
+        cdef SCIP_Bool stored
+        if free:
+            PY_SCIP_CALL(SCIPaddSolFree(self._scip, &solution.sol, &stored))
+        else:
+            PY_SCIP_CALL(SCIPaddSol(self._scip, solution.sol, &stored))
+        return stored
+
+    def freeSol(self, Solution solution):
+        """Free given solution
+
+        Keyword arguments:
+        solution -- solution to be freed
+        """
+        PY_SCIP_CALL(SCIPfreeSol(self._scip, &solution.sol))
 
     def getSols(self):
         """Retrieve list of all feasible primal solutions stored in the solution storage."""
